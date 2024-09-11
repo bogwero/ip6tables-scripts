@@ -1,0 +1,226 @@
+Advanced Perimeter based iptables Firewall on Linux 
+
+
+Let's say you spawn a box on AWS, Azure, Vultr or any other public cloud provider. Chances are this box can talk to the whole internet and the internet can talk back to you if there is no edge firewall in-place and/or NAT translation configured. An attacker does not care if your box is connected with a public routable IP-address, as long as there is a way to establish a session. One way to limit exposure of your running services is to configure a host-based firewall, which should be a part of your security in-depth framework. This blog post will teach you how to create a thorough network perimeter around your boxes.
+
+iptables can help you segregate traffic. Should a globally routable host be able to establish a session with your LDAP or SQL daemon, or only systems on the local network? This is exactly where iptables comes into place. Since iptables is agnostic to the distribution version, you can leverage this firewall rule-set to macOS, Ubuntu, Debian, BSD or any other Linux-like operating system.
+
+As of writing this blog post, Debian released a new major version with code name Buster which comes with nftables, iptables' successor. nftables consolidates network control on OSI layers 2, 3 and 4 in this one tool. I suggest you look into nftables instead if you are about to write a new set of firewall rules from scratch. However, this blog post is about iptables which is the user-space build-in Linux firewall running in kernel space.
+
+perimeter
+Image source: Star Wars: Episode II Attack of the Clones
+Let's Take Control of your Host
+
+Keep in mind that firewalls do not keep the bad guys out. iptables firewall is an additional level of network segregation to gain more control. A malicious user could just as well spawn a reverse shell on ports which are already open. Deep Packet Inspection (DPI) should give us insight in the data streams, while application-based reverse proxies can help with mitigating this threat. I will cover this in my next blog post where we will discuss bastion hosts.
+
+Also be aware that iptables does not process any IPv6 traffic. Instead the ip6tables utility is used for IPv6 firewall rules. Even if you do not use any IPv6 applications, you still want to prevent any unauthorized traffic from going in or out of your network. We separate IPv4 and IPv6 rules in the following files accordingly:
+
+$ touch /sbin/scripts/4iptables.sh
+$ touch /sbin/scripts/6iptables.sh
+
+By default iptables is enabled with an allow any any rule. This looks as following:
+
+$ iptables -L
+
+Chain INPUT (policy ACCEPT)
+target     prot opt source               destination
+
+Chain FORWARD (policy ACCEPT)
+target     prot opt source               destination
+
+Chain OUTPUT (policy ACCEPT)
+target     prot opt source               destination
+
+Base iptables configuration
+
+We start with the IPv4 rule-set. Let's edit the /sbin/scripts/4iptables.sh file.
+
+Ideally, you would have separated (virtual) network interfaces for data and network management traffic. The $NIC_DATA should process HTTPS traffic and DNS queries, while the NIC_MGMT interface should process management traffic such as incoming SSH connections. You can use the same (v)NIC and IP-address in case you have only a single network interface on your system or if you do not segregate data and management traffic.
+
+The $SERVER_IP_DATA and $SERVER_IP_MGMT is used later on for binding the service or deamon to the IP-address. The $LOOPBACK interface should not be changed.
+
+#!/bin/bash
+#iptables base-script
+LOOPBACK="127.0.0.0/8"
+NIC_DATA="eth0"
+NIC_MGMT="eth1"
+SERVER_IP_DATA=$(hostname -I | awk '{print $1}')
+SERVER_IP_MGMT=$(hostname -I | awk '{print $2}')
+LOCAL_NETWORK="192.168.1.1/24"
+DNS1="1.1.1.1"
+DNS2="8.8.8.8"
+
+Next, we clear and flush all existing IPv4 iptables rules with iptables -F && iptables -X.
+
+Then, we DROP all incoming and outcoming network traffic. This is referred to as an deny any any rule. Dropping network traffic will trick the source the host does not exist. Rejecting network traffic means we do not allow the connection by sending back an error. This means the source knows a firewall is blocking the traffic. We prefer to DROP traffic over rejecting traffic for this exact reason;)
+
+Lastly, traffic from and to the $LOOPBACK interface is allowed, but only if the source is the loopback interface. The $LOOPBACK variable is defined above.
+
+iptables -F
+iptables -X
+
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+iptables -A INPUT -s $LOOPBACK ! -i lo -j DROP
+
+We drop traffic which is INVALID or non-conforming packets such as packets with malformed headers:
+
+iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+
+Input chain
+
+The INPUT section controls the behavior for incoming connections by matching an IP address and port number to a rule in the input chain. The INPUT section is for hosted applications such as proxy servers, web or SSH services. iptables allows us to configure a module state to either NEW, ESTABLISHED or RELATED:
+
+NEW refers to incoming packets that are new connections initiated by the host system.
+
+ESTABLISHED & RELATED refer to packets that are part of an already established connection.
+
+The following rule-set example allows us to receive incoming openVPN connections to our OpenVPN daemon.
+
+################
+#INPUT rules   #
+################
+iptables -A INPUT -i $NIC_MGMT -p udp -s 0/0 -d $SERVER_IP_MGMT --sport 32768:65535 --dport 1194 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A OUTPUT -o $NIC_MGMT -p udp -s $SERVER_IP_MGMT -d 0/0 --sport 1194 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+
+Output chain
+
+The OUTPUT chain is used for connections initiated by the host.
+
+Let's start off with an easy one by allowing outgoing SSH connections. The following iptables rules state the following: ACCEPT outgoing traffic on interface $NIC_DATA if its TCP traffic destined for the host IP address from everywhere if the destination port is 22 and the host dynamic port range is 32768:65535, only when the connection is initiated by this very host.
+
+Next, ACCEPT incoming traffic on interface $NIC_DATA if TCP traffic destined for the host IP address from everywhere, if the source service port is 22 and dynamic port range is 32768:65535, only when the connection is already established which is stated in the line above.
+
+#################
+#OUTPUT rules   #
+#################
+iptables -A OUTPUT -o $NIC_DATA -p tcp -s $SERVER_IP_DATA -d 0/0 --sport 32768:65535 --dport 22 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p tcp -d $SERVER_IP_DATA -s 0/0 --sport 22 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+
+We allow recursive DNS queries to $DNS1 and $DNS2 servers, which belong to Cloudflare and Google. It is recommended to change these variables to your on-premise DNS servers so you can stream-line DNS traffic.
+
+iptables -A OUTPUT -o $NIC_DATA -p udp -s $SERVER_IP_DATA -d $DNS1 --sport 32768:65535 --dport 53 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p udp -s $DNS1 -d $SERVER_IP_DATA --sport 53 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+iptables -A OUTPUT -o $NIC_DATA -p udp -s $SERVER_IP_DATA -d $DNS2 --sport 32768:65535 --dport 53 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p udp -s $DNS2 -d $SERVER_IP_DATA --sport 53 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+
+Ping does not rely on TCP or UDP but ICMP. We allow to ping to any which is ICMP type 8 echo request, but only allow ICMP requests back in when initiated from this machine. Note that ping requests to this host will not be answered since only ICMP type 0 echo replies are accepted when the session is already established.
+
+iptables -A OUTPUT -o $NIC_DATA -p icmp --icmp-type 8 -s $SERVER_IP_DATA -d 0/0 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p icmp --icmp-type 0 -d $SERVER_IP_DATA -s 0/0 -m state --state ESTABLISHED -j ACCEPT
+
+Most hosts require HTTP(S) connections for either browsing or updating packages. Configure a reverse web-proxy to gain full control over port 443 and port 80.
+
+iptables -A OUTPUT -o $NIC_DATA -p tcp -m tcp -s $SERVER_IP_DATA --sport 32768:65535 -d 0/0 --dport 80 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p tcp -s 0/0 -d $SERVER_IP_DATA --sport 80 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+iptables -A OUTPUT -o $NIC_DATA -p tcp -m tcp -s $SERVER_IP_DATA --sport 32768:65535 -d 0/0 --dport 443 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p tcp -s 0/0 -d $SERVER_IP_DATA --sport 443 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+
+Allow DHCP handshakes when your IP-address is not configured statically.
+
+iptables -A OUTPUT -o $NIC_DATA -p udp -s $SERVER_IP_DATA -d 0/0 --sport 32768:65535 --dport 68 -m state --state NEW,ESTABLISHED -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p udp -d $SERVER_IP_DATA -s 0/0 --sport 68 --dport 32768:65535 -m state --state ESTABLISHED -j ACCEPT
+
+The Network Time Protocol (NTP) is important for HTTPS, apt-get and system logging purposes. NTP communicates over UTP and we only accept connection coming back from source ports. Unlike DNS, we cannot specify NTP servers since they are rather dynamic based on geo-location of an IP-address.
+
+iptables -A OUTPUT -o $NIC_DATA -p udp -s $SERVER_IP_DATA -d 0/0 --sport 32768:65535 --dport 123 -m state --state NEW -j ACCEPT
+iptables -A INPUT -i $NIC_DATA -p udp -d $SERVER_IP_DATA -s 0/0 --sport 123 --dport 32768:65535 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+Closing the perimeter
+
+We make sure nothing else goes in or out of this host:
+
+iptables -A INPUT -j DROP
+iptables -A OUTPUT -j DROP
+
+Let's save the configuration to an iptables .rules file
+
+sudo sh -c "iptables-save > /sbin/scripts/iptables4.rules"
+
+The complete 4iptables.sh script is available on GitHub
+IPv6 firewall rules
+
+The following persistent IPv6 iptables firewall script will block any IPv6 connections going in and out of the host.
+
+$ vi /sbin/scripts/6iptables.sh
+
+#!/bin/bash
+#persistent IPv6 iptables firewall script
+
+#Reset all IPv6 iptables rules
+ip6tables -F
+ip6tables -X
+
+#Disallowing any IPv6 traffic as deny any any
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
+ip6tables -P OUTPUT DROP
+
+ip6tables -A INPUT -s ::1/128 ! -i lo -j DROP
+
+#Save IPv6 iptables config
+sudo sh -c "ip6tables-save > /sbin/scripts/iptables6.rules"
+
+Persistent configuration
+
+By default, iptables will not enforce a persistent configuration. This means all firewall rules will be reset during a system reboot. We can load the rule-set right after we bring up the network interfaces up at boot to achieve a persistent firewall configuration:
+
+$ chmod +x /sbin/scripts/4iptables.sh
+$ chmod +x /sbin/scripts/6iptables.sh
+
+$ bash /sbin/scripts/4iptables.sh
+$ bash /sbin/scripts/6iptables.sh
+
+$ chmod +x /sbin/scripts/iptables4.rules
+$ chmod +x /sbin/scripts/iptables6.rules
+
+$ vi /etc/network/if-pre-up.d/iptables
+
+#!/bin/bash
+/sbin/iptables-restore < /sbin/scripts/iptables4.rules
+/sbin/ip6tables-restore < /sbin/scripts/iptables6.rules
+
+chmod +x /etc/network/if-pre-up.d/iptables
+
+We can test and analyze how many hits occur on the defined iptables rule-sets:
+
+$ iptables -vL
+Chain INPUT (policy DROP 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+    1    29 ACCEPT     all  --  lo     any     anywhere             anywhere
+    0     0 DROP       all  --  !lo    any     loopback/8           anywhere
+   21   840 DROP       all  --  any    any     anywhere             anywhere             ctstate INVALID
+    0     0 ACCEPT     udp  --  eth0   any     anywhere             debian               udp spts:32768:65535 dpt:1043 state NEW,ESTABLISHED
+    0     0 ACCEPT     tcp  --  eth0   any     anywhere             debian               tcp spt:ssh dpts:32768:65535 state ESTABLISHED
+  230 33925 ACCEPT     udp  --  eth0   any     1.1.1.1              debian               udp spt:domain dpts:32768:65535 state ESTABLISHED
+    0     0 ACCEPT     udp  --  eth0   any     8.8.8.8              debian               udp spt:domain dpts:32768:65535 state ESTABLISHED
+    0     0 ACCEPT     icmp --  eth0   any     anywhere             debian               icmp echo-reply state ESTABLISHED
+   80 18694 ACCEPT     tcp  --  eth0   any     anywhere             debian               tcp spt:http dpts:32768:65535 state ESTABLISHED
+ 1490 4228K ACCEPT     tcp  --  eth0   any     anywhere             debian               tcp spt:https dpts:32768:65535 state ESTABLISHED
+    0     0 ACCEPT     udp  --  eth0   any     anywhere             debian               udp spt:bootpc dpts:32768:65535 state ESTABLISHED
+    0     0 ACCEPT     udp  --  eth0   any     anywhere             debian               udp spt:ntp dpts:32768:65535 state RELATED,ESTABLISHED
+    8  1728 DROP       all  --  any    any     anywhere             anywhere
+
+Chain FORWARD (policy DROP 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+
+Chain OUTPUT (policy DROP 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+    1    29 ACCEPT     all  --  any    lo      anywhere             anywhere
+    0     0 ACCEPT     udp  --  any    eth0    debian               anywhere             udp spt:1043 dpts:32768:65535 state ESTABLISHED
+    0     0 ACCEPT     tcp  --  any    eth0    debian               anywhere             tcp spts:32768:65535 dpt:ssh state NEW,ESTABLISHED
+  230 15443 ACCEPT     udp  --  any    eth0    debian               1.1.1.1              udp spts:32768:65535 dpt:domain state NEW,ESTABLISHED
+    0     0 ACCEPT     udp  --  any    eth0    debian               8.8.8.8              udp spts:32768:65535 dpt:domain state NEW,ESTABLISHED
+    1    84 ACCEPT     icmp --  any    eth0    debian               anywhere             icmp echo-request state NEW,ESTABLISHED
+   94 12874 ACCEPT     tcp  --  any    eth0    debian               anywhere             tcp spts:32768:65535 dpt:http state NEW,ESTABLISHED
+ 1436  173K ACCEPT     tcp  --  any    eth0    debian               anywhere             tcp spts:32768:65535 dpt:https state NEW,ESTABLISHED
+    0     0 ACCEPT     udp  --  any    eth0    debian               anywhere             udp spts:32768:65535 dpt:bootpc state NEW,ESTABLISHED
+    0     0 ACCEPT     udp  --  any    eth0    debian               anywhere             udp spts:32768:65535 dpt:ntp state NEW
+    1    79 DROP       all  --  any    any     anywhere             anywhere
+
+Edit (June 2020): iptables is now officially replaced by nftables.
