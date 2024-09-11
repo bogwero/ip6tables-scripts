@@ -7,8 +7,7 @@ iptables can help you segregate traffic. Should a globally routable host be able
 
 As of writing this blog post, Debian released a new major version with code name Buster which comes with nftables, iptables' successor. nftables consolidates network control on OSI layers 2, 3 and 4 in this one tool. I suggest you look into nftables instead if you are about to write a new set of firewall rules from scratch. However, this blog post is about iptables which is the user-space build-in Linux firewall running in kernel space.
 
-perimeter
-Image source: Star Wars: Episode II Attack of the Clones
+
 Let's Take Control of your Host
 
 Keep in mind that firewalls do not keep the bad guys out. iptables firewall is an additional level of network segregation to gain more control. A malicious user could just as well spawn a reverse shell on ports which are already open. Deep Packet Inspection (DPI) should give us insight in the data streams, while application-based reverse proxies can help with mitigating this threat. I will cover this in my next blog post where we will discuss bastion hosts.
